@@ -34,12 +34,4 @@ def main():
 
     print(f"[VERT]  abo(6kVA) = {fmt_abo(abo_v)} €/mois   kWh = {fmt_kwh(base_v)} €/kWh")
     print(f"[BLEU]  abo(6kVA) = {fmt_abo(abo_b)} €/mois   kWh = {fmt_kwh(base_b)} €/kWh")
-
-    # Insertion DB (adapte les champs selon ton ORM)
-    Prix_EDF_vert.create(prix=float(base_v) if base_v is not None else None,
-                         abo=float(abo_v))
-    Prix_EDF_bleu.create(prix=float(base_b) if base_b is not None else None,
-                         abo=float(abo_b))
-
-    print("Insertion en base OK.")
 ```

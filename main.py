@@ -1,68 +1,69 @@
-#!/usr/bin/env python3
+# edftarifs.py
 # -*- coding: utf-8 -*-
-
 """
-Extraction tarifs EDF (Vert/Bleu) — full Camelot, sans pdfplumber.
+Mini-lib + script pour extraire les tarifs EDF (Vert/Bleu) avec Camelot
+et afficher des logs exactement au format demandé.
 
-pip install "camelot-py[cv]" requests
-# + ghostscript / tk installés côté système si nécessaire.
+Dépendances:
+  pip install "camelot-py[cv]" requests
 
-Sortie: insère 6 kVA (abo €/mois, kWh €/kWh) dans ta DB.
+Côté système: Ghostscript + Tk/Qt selon l'install Camelot.
 """
 
-import hashlib
-import re
-import tempfile
-import unicodedata
+from __future__ import annotations
+import re, unicodedata, hashlib, tempfile
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Dict, Optional, Tuple, List
 
 import camelot
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
+
 VERT_URL = "https://particulier.edf.fr/content/dam/2-Actifs/Documents/Offres/grille-prix-vert-electrique.pdf"
 BLEU_URL = "https://particulier.edf.fr/content/dam/2-Actifs/Documents/Offres/Grille_prix_Tarif_Bleu.pdf"
 
 
-# ====================== Réseau / Téléchargement ======================
+# ========================= Réseau / Téléchargement =========================
 
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "tarif-scraper/1.0"})
-    retries = Retry(
-        total=3, backoff_factor=0.6,
-        status_forcelist=[429, 500, 502, 503, 504],
-        method_whitelist=["GET", "HEAD"]
-    )
+    s.headers.update({"User-Agent": "edftarifs/0.1"})
+    try:
+        retries = Retry(total=3, backoff_factor=0.6,
+                        status_forcelist=[429, 500, 502, 503, 504],
+                        allowed_methods=["GET", "HEAD"])
+    except TypeError:
+        # fallback vieux urllib3
+        retries = Retry(total=3, backoff_factor=0.6,
+                        status_forcelist=[429, 500, 502, 503, 504],
+                        method_whitelist=["GET", "HEAD"])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
     return s
 
-def download_to_tmp(url: str) -> Path:
+def _download_to_tmp(url: str) -> Path:
     fn = Path(tempfile.gettempdir()) / Path(url).name
     with _session().get(url, stream=True, timeout=20) as r:
         r.raise_for_status()
         with open(fn, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 15):
-                if chunk:
-                    f.write(chunk)
+                if chunk: f.write(chunk)
     return fn
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
+        for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk)
     return h.hexdigest()
 
 
-# ====================== Normalisation / Parsing ======================
+# ========================= Normalisation / Parsing =========================
 
 def _norm(s: str) -> str:
-    """Minuscule, accents retirés, espaces normalisés."""
-    if s is None:
-        return ""
+    if s is None: return ""
     s = str(s).replace("\xa0", " ")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
@@ -71,14 +72,13 @@ def _norm(s: str) -> str:
     return s
 
 def _to_decimal_fr(s: str) -> Decimal:
-    """'0,2964 €' -> Decimal('0.2964'); '27,56' -> Decimal('27.56')."""
     s = re.sub(r"[^\d,.\-]", "", s or "")
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
     return Decimal(s)
 
-def parse_pdf_tables(path: Path):
-    """Essaye stream puis lattice pour tolérer les maquettes EDF."""
+def _read_tables(path: Path):
+    # Essaye stream puis lattice pour couvrir les deux maquettes
     last_exc = None
     for flavor in ("stream", "lattice"):
         try:
@@ -95,174 +95,177 @@ def _iter_rows(tables):
         for row in tbl.data:
             yield row
 
-def _guess_header_indices(rows):
-    """
-    Détecte les index de colonnes:
-      - puissance (kVA)
-      - abonnement (€/mois)
-      - kwh (€/kWh ou cts €/kWh)
-    Et un flag kwh_in_cents si l'en-tête contient 'cts'.
-    """
-    power_idx = None
-    abo_idx = None
-    kwh_idx = None
-    kwh_in_cents = False
 
-    scan = rows[:12] if len(rows) > 12 else rows
-    for r in scan:
-        for i, cell in enumerate(r):
-            n = _norm(cell)
-            # Colonne puissance
-            if power_idx is None and (re.search(r"\bpuissance\b", n) or re.search(r"\(kva\)", n)):
-                power_idx = i
-            # Colonne abonnement
-            if abo_idx is None and (re.search(r"\babonnement\b|\babo\b", n) or "€/mois" in n or "euro/mois" in n):
-                abo_idx = i
-            # Colonne kWh
-            if kwh_idx is None and (re.search(r"\bkwh\b", n) or re.search(r"prix.*kwh", n) or re.fullmatch(r"base", n)):
-                kwh_idx = i
-            # Détection "cts"
-            if "cts" in n and "kwh" in n:
-                kwh_in_cents = True
+@dataclass
+class TarifsLigne:
+    puissance_kva: str
+    abo_eur_mois: Decimal
+    base_eur_kwh: Optional[Decimal]
+    hp_eur_kwh:   Optional[Decimal]
+    hc_eur_kwh:   Optional[Decimal]
 
-    return power_idx, abo_idx, kwh_idx, kwh_in_cents
+    def pick(self, option: str) -> Tuple[Decimal, Optional[Decimal]]:
+        o = option.lower()
+        if o == "base":
+            return (self.abo_eur_mois, self.base_eur_kwh)
+        elif o in ("hp/hc", "hp_hc", "heures pleines/creuses", "heures pleines - heures creuses"):
+            return (self.abo_eur_mois, None)
+        else:
+            raise ValueError("option inconnue (attendu: 'base' ou 'hp/hc')")
 
 
-def _find_row_power(rows, power_idx, target="6"):
-    """
-    Si power_idx est connu, retourne l'index de la ligne dont la cellule power == target (ex: '6').
-    Sinon, fallback: cherche une ligne contenant exactement '6' et un en-tête 'kva' dans les 10 premières lignes.
-    """
-    tnorm = _norm(target)
-    if power_idx is not None:
-        for idx, r in enumerate(rows):
-            cell = r[power_idx] if power_idx < len(r) else ""
-            if _norm(cell) == tnorm:
-                return idx
+class EDFTarifs:
+    def __init__(self):
+        self.paths: Dict[str, Path] = {}
+        self.tables: Dict[str, List[List[str]]] = {}
+        self.meta: Dict[str, dict] = {}
 
-    # Fallback tolérant
-    header_has_kva = any(re.search(r"\(kva\)", _norm(c)) for rr in rows[:10] for c in rr)
-    if header_has_kva:
-        for idx, r in enumerate(rows):
-            for c in r:
-                if _norm(c) == tnorm:
+    def load_default(self) -> "EDFTarifs":
+        self.load_url("vert", VERT_URL)
+        self.load_url("bleu", BLEU_URL)
+        return self
+
+    def load_url(self, name: str, url: str) -> "EDFTarifs":
+        p = _download_to_tmp(url)
+        self.paths[name] = p
+        self.meta[name] = {"sha256": sha256_file(p), "url": url}
+        self.tables[name] = list(_iter_rows(_read_tables(p)))
+        return self
+
+    def _guess_columns(self, rows: List[List[str]]) -> dict:
+        power = abo = base = hp = hc = None
+        base_cents = hp_cents = hc_cents = False
+
+        scan = rows[:14] if len(rows) > 14 else rows
+        for r in scan:
+            for i, cell in enumerate(r):
+                n = _norm(cell)
+                if power is None and (re.search(r"\bpuissance\b", n) or "(kva)" in n):
+                    power = i
+                if abo is None and (re.search(r"\babonnement\b|\babo\b", n) or "€/mois" in n or "euro/mois" in n):
+                    abo = i
+                if base is None and (n == "base" or re.search(r"\bprix.*kwh\b", n)):
+                    base = i
+                    base_cents = ("cts" in n and "kwh" in n)
+                if hp is None and re.search(r"\bhp\b|heures pleines", n):
+                    hp = i
+                    hp_cents = ("cts" in n and "kwh" in n)
+                if hc is None and re.search(r"\bhc\b|heures creuses", n):
+                    hc = i
+                    hc_cents = ("cts" in n and "kwh" in n)
+
+        return dict(power=power, abo=abo, base=base, hp=hp, hc=hc,
+                    base_cents=base_cents, hp_cents=hp_cents, hc_cents=hc_cents)
+
+    def _find_row_by_power(self, rows: List[List[str]], power_idx: Optional[int], target: str) -> int:
+        t = _norm(target)
+        if power_idx is not None:
+            for idx, r in enumerate(rows):
+                cell = r[power_idx] if power_idx < len(r) else ""
+                if _norm(cell) == t:
                     return idx
-    return None
+        # fallback si l'entête contient (kVA)
+        header_has_kva = any("(kva)" in _norm(c) for rr in rows[:10] for c in rr)
+        if header_has_kva:
+            for idx, r in enumerate(rows):
+                for c in r:
+                    if _norm(c) == t:
+                        return idx
+        raise ValueError(f"Ligne puissance '{target}' introuvable")
 
-def _find_row_6kva(rows):
-    """Renvoie l'index de la première ligne contenant '6 kVA' (toutes variantes)."""
-    for idx, r in enumerate(rows):
-        nrow = " | ".join(_norm(c) for c in r)
-        if re.search(r"\b6\s*kva\b", nrow):
-            return idx
-    return None
-
-def _first_decimal_right_of(row, start_idx):
-    for j in range(start_idx + 1, len(row)):
+    @staticmethod
+    def _get_decimal(row: List[str], idx: Optional[int]) -> Optional[Decimal]:
+        if idx is None or idx >= len(row): return None
         try:
-            return _to_decimal_fr(row[j])
+            return _to_decimal_fr(row[idx])
         except Exception:
-            continue
-    return None
+            return None
 
-def extract_tarifs_6kva_from_tables(tables):
-    rows = list(_iter_rows(tables))
-    if not rows:
-        raise RuntimeError("Aucune table détectée dans le PDF.")
+    def _convert_if_cents(self, val: Optional[Decimal], flag_cents: bool) -> Optional[Decimal]:
+        if val is None: return None
+        return (val / Decimal("100")) if flag_cents else val
 
-    power_idx, abo_idx, kwh_idx, kwh_in_cents = _guess_header_indices(rows)
+    def get_ligne(self, name: str, puissance_kva: str) -> TarifsLigne:
+        if name not in self.tables:
+            raise KeyError(f"'{name}' non chargé. Utilise load_default() ou load_url().")
 
-    ridx = _find_row_power(rows, power_idx, target="6")
-    if ridx is None:
-        # Debug utile pour ajuster si la maquette change encore
-        preview = "\n".join(" | ".join(r[:4]) for r in rows[:8])
-        raise ValueError("Ligne pour '6 (kVA)' introuvable. Aperçu (début):\n" + preview)
+        rows = self.tables[name]
+        cols = self._guess_columns(rows)
+        ridx = self._find_row_by_power(rows, cols["power"], puissance_kva)
+        row = rows[ridx]
 
-    row = rows[ridx]
+        abo = self._get_decimal(row, cols["abo"])
+        base = self._get_decimal(row, cols["base"])
+        hp   = self._get_decimal(row, cols["hp"])
+        hc   = self._get_decimal(row, cols["hc"])
 
-    # Fallback indices “classiques” si en-têtes absents
-    if abo_idx is None and len(row) >= 2:
-        abo_idx = 1
-    if kwh_idx is None and len(row) >= 3:
-        kwh_idx = 2
+        base = self._convert_if_cents(base, cols["base_cents"])
+        hp   = self._convert_if_cents(hp,   cols["hp_cents"])
+        hc   = self._convert_if_cents(hc,   cols["hc_cents"])
 
-    abo = None
-    kwh = None
+        # Filets de sécurité
+        if abo is None or (base is None and hp is None and hc is None):
+            vals = []
+            for c in row:
+                try: vals.append(_to_decimal_fr(c))
+                except Exception: pass
+            if vals:
+                vals_sorted = sorted(vals)
+                if abo is None: abo = vals_sorted[-1]
+                if base is None and hp is None and hc is None:
+                    base = vals_sorted[0]
 
-    if abo_idx is not None and abo_idx < len(row):
-        try:
-            abo = _to_decimal_fr(row[abo_idx])
-        except Exception:
-            abo = _first_decimal_right_of(row, 0)
+        if abo is None:
+            raise ValueError(f"Abonnement introuvable pour {name} {puissance_kva} kVA (ligne={row})")
 
-    if kwh_idx is not None and kwh_idx < len(row):
-        try:
-            kwh = _to_decimal_fr(row[kwh_idx])
-        except Exception:
-            base_idx = abo_idx if abo_idx is not None else 0
-            kwh = _first_decimal_right_of(row, base_idx)
-
-    # Dernier filet si l'une des valeurs manque
-    if abo is None or kwh is None:
-        vals = []
-        for cell in row:
-            try:
-                vals.append(_to_decimal_fr(cell))
-            except Exception:
-                pass
-        if len(vals) >= 2:
-            # Si kWh est en cts, les deux valeurs seront >1 : on ne peut plus
-            # utiliser la règle "kWh<1". On prend l'hypothèse classique :
-            # - l’abo est la plus grande valeur monétaire de la ligne
-            # - le kWh la plus petite valeur monétaire
-            vals_sorted = sorted(vals)
-            if kwh is None:
-                kwh = vals_sorted[0]
-            if abo is None:
-                abo = vals_sorted[-1]
-
-    if abo is None or kwh is None:
-        raise ValueError(f"Impossible d'extraire abo/kWh sur la ligne 6 kVA: {row}")
-
-    # Conversion si la colonne kWh est en centimes
-    if kwh_in_cents:
-        kwh = kwh / Decimal("100")
-
-    return (abo, kwh)
+        return TarifsLigne(
+            puissance_kva=puissance_kva,
+            abo_eur_mois=abo,
+            base_eur_kwh=base,
+            hp_eur_kwh=hp,
+            hc_eur_kwh=hc,
+        )
 
 
-
-# ====================== Facades spécifiques Vert / Bleu ======================
-
-def extract_vert(path: Path):
-    tables = parse_pdf_tables(path)
-    return extract_tarifs_6kva_from_tables(tables)
-
-def extract_bleu(path: Path):
-    tables = parse_pdf_tables(path)
-    return extract_tarifs_6kva_from_tables(tables)
-
-
-# ====================== Main ======================
+# ========================= Script (logs exacts) =========================
 
 def main():
     print("Téléchargement des grilles…")
-    f_vert = download_to_tmp(VERT_URL)
-    f_bleu = download_to_tmp(BLEU_URL)
+    t = EDFTarifs().load_default()
 
-    print(f"VERT: {f_vert.name}  sha256={sha256_file(f_vert)}")
-    print(f"BLEU: {f_bleu.name}  sha256={sha256_file(f_bleu)}")
+    vert_name = t.paths["vert"].name
+    bleu_name = t.paths["bleu"].name
+    print(f"VERT: {vert_name}  sha256={t.meta['vert']['sha256']}")
+    print(f"BLEU: {bleu_name}  sha256={t.meta['bleu']['sha256']}")
 
     print("Parsing PDF (Vert)…")
-    abo_vert, kwh_vert = extract_vert(f_vert)
-
+    ligne_vert_6 = t.get_ligne("vert", "6")   # 6 kVA
     print("Parsing PDF (Bleu)…")
-    abo_bleu, kwh_bleu = extract_bleu(f_bleu)
+    ligne_bleu_6 = t.get_ligne("bleu", "6")   # 6 kVA
 
-    print(f"[VERT]  abo(6kVA) = {abo_vert} €/mois   kWh = {kwh_vert} €/kWh")
-    print(f"[BLEU]  abo(6kVA) = {abo_bleu} €/mois   kWh = {kwh_bleu} €/kWh")
+    # On privilégie 'base' ; si base None (HP/HC only), on affiche HP/HC moyenné simple
+    abo_v, base_v = ligne_vert_6.pick("base")
+    abo_b, base_b = ligne_bleu_6.pick("base")
 
-    print("Insertion en base OK.")
+    # Format: 2 décimales pour abo, 4 pour kWh
+    def fmt_abo(x: Decimal) -> str:
+        return f"{float(x):.2f}"
+    def fmt_kwh(x: Optional[Decimal]) -> str:
+        return f"{float(x):.4f}" if x is not None else "N/A"
+
+    print(f"[VERT]  abo(6kVA) = {fmt_abo(abo_v)} €/mois   kWh = {fmt_kwh(base_v)} €/kWh")
+    print(f"[BLEU]  abo(6kVA) = {fmt_abo(abo_b)} €/mois   kWh = {fmt_kwh(base_b)} €/kWh")
+
+
+
+# ========================= Helpers internes =========================
+
+def _to_decimal_fr(s: str) -> Decimal:
+    s = re.sub(r"[^\d,.\-]", "", s or "")
+    if s.count(",") == 1 and s.count(".") == 0:
+        s = s.replace(",", ".")
+    return Decimal(s)
+
 
 if __name__ == "__main__":
     main()

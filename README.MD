@@ -3,9 +3,9 @@
 <img src="https://github.com/vBlackOut/TarifEDF/blob/main/tarif.png"/>
 
 
-
-le lancement du script ce fait simplement.
-la fonction main est içi.
+<br><br>
+le lancement du script ce fait simplement.  
+la fonction main est içi.  
 
 ```
 def main():

@@ -7,7 +7,7 @@
 le lancement du script ce fait simplement.  
 la fonction main est içi.  
 
-```
+```python
 def main():
     print("Téléchargement des grilles…")
     t = EDFTarifs().load_default()
